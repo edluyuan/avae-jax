@@ -21,12 +21,9 @@ class GMM:
         self.n_mixes = n_mixes
         self.n_test_set_samples = n_test_set_samples
         # PRNG key
-        self._key = random.PRNGKey(seed)
 
-        # Initialize means and log-variances
-        key, subkey = random.split(self._key)
-        self._key = key
-        self.locs = (random.uniform(subkey, (n_mixes, dim), minval=-0.5, maxval=0.5) * 2 * loc_scaling)
+        self.key = random.key(seed)
+        self.locs = (random.uniform(self.key, (n_mixes, dim), minval=-0.5, maxval=0.5) * 2 * loc_scaling)
         log_var = jnp.ones((n_mixes, dim)) * log_var_scaling
 
         # Store scale_tril for diagonal covariance
@@ -36,63 +33,76 @@ class GMM:
         # Uniform mixture weights
         self.log_weights = jnp.log(jnp.ones(n_mixes) / n_mixes)
 
-    @jit
     def log_prob(self, x: jnp.ndarray) -> jnp.ndarray:
         """
         Compute log probability of x under the GMM.
         x: [..., D]
         returns: [...]
         """
-        # Expand x to [..., 1, D] and locs to [1, K, D]
-        x_exp = x[..., None, :]
-        locs = self.locs[None, :, :]
-        diffs = x_exp - locs  # [..., K, D]
-
-        # Solve L y = diff for y, where scale_tril[k] = L
-        # Compute for each mixture: mahalanobis squared
-        def comp_mahal(tril, diff):
-            # tril: [D, D], diff: [..., D]
-            y = jax.scipy.linalg.solve_triangular(tril, diff.T, lower=True)
-            return jnp.sum(y**2, axis=0)
-
-        mahal = jnp.stack([comp_mahal(self.scale_tril[k], diffs[..., k, :])
-                           for k in range(self.n_mixes)], axis=-1)  # [..., K]
-
-        # Log determinants
-        logdets = jnp.sum(jnp.log(jnp.diagonal(self.scale_tril, axis1=1, axis2=2)), axis=1)  # [K]
-        const = -0.5 * (self.dim * jnp.log(2 * jnp.pi) + 2 * logdets)  # [K]
-
-        # Component log probs: [..., K]
-        comp_log = const + (-0.5 * mahal)
-        # Add mixture log weights
-        weighted = comp_log + self.log_weights
-        # LogSumExp over mixtures
-        return jax.scipy.special.logsumexp(weighted, axis=-1)
+        return _log_prob_jit(x, self.locs, self.scale_tril, self.log_weights, self.dim, self.n_mixes)
 
     def sample(self, shape: Tuple[int, ...], key: Optional[jnp.ndarray] = None) -> jnp.ndarray:
         """
         Sample from the GMM.
         shape: output shape for samples (e.g. (N,)) will create samples of shape [..., D]
         """
-        if key is None:
-            key = self._key
-        key, subkey = random.split(key)
+
         # Sample mixture indices
-        mix_id = random.categorical(subkey, self.log_weights, shape=shape)
+        mix_id = random.categorical(self.key, self.log_weights, shape=shape)
         # Sample standard normals
-        key, subkey = random.split(key)
-        eps = random.normal(subkey, shape + (self.dim,))
+
+        eps = random.normal(self.key, shape + (self.dim,))
         # Gather locs and scale_tril
         locs = self.locs[mix_id]
         trils = self.scale_tril[mix_id]
         # Transform
         samples = jnp.einsum('...ij,...j->...i', trils, eps) + locs
-        self._key = key
+
         return samples
 
     @property
     def test_set(self) -> jnp.ndarray:
         return self.sample((self.n_test_set_samples,))
+
+
+@jit
+def _log_prob_jit(x, locs, scale_tril, log_weights, dim, n_mixes):
+    """
+    JIT-compiled log probability computation for the GMM.
+    """
+    # Expand x to [..., 1, D] and locs to [1, K, D]
+    x_exp = x[..., None, :]
+    locs_exp = locs[None, :, :]
+    diffs = x_exp - locs_exp  # [..., K, D]
+
+    # Vectorized computation of Mahalanobis distances
+    # For each sample and mixture component, compute (x-mu)^T Sigma^{-1} (x-mu)
+    # where Sigma^{-1} = (L L^T)^{-1} = L^{-T} L^{-1}
+
+    # Solve L y = diff for each mixture component
+    # diffs: [..., K, D], scale_tril: [K, D, D]
+    # We need to solve scale_tril[k] @ y[..., k, :] = diffs[..., k, :] for each k
+
+    def solve_triangular_batch(L, b):
+        # L: [K, D, D], b: [..., K, D] -> [..., K, D]
+        return jax.vmap(
+            lambda L_k, b_k: jax.scipy.linalg.solve_triangular(L_k, b_k.T, lower=True).T,
+            in_axes=(0, -2), out_axes=-2
+        )(L, b)
+
+    y = solve_triangular_batch(scale_tril, diffs)  # [..., K, D]
+    mahal = jnp.sum(y**2, axis=-1)  # [..., K]
+
+    # Log determinants
+    logdets = jnp.sum(jnp.log(jnp.diagonal(scale_tril, axis1=1, axis2=2)), axis=1)  # [K]
+    const = -0.5 * (dim * jnp.log(2 * jnp.pi) + 2 * logdets)  # [K]
+
+    # Component log probs: [..., K]
+    comp_log = const + (-0.5 * mahal)
+    # Add mixture log weights
+    weighted = comp_log + log_weights
+    # LogSumExp over mixtures
+    return jax.scipy.special.logsumexp(weighted, axis=-1)
 
 
 def plot_contours(log_prob_func,
